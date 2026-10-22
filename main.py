@@ -133,7 +133,7 @@ def preprocess_image(
         raise ValueError(f"Normalizacao desconhecida: {normalization}")
 
     if np.issubdtype(dtype, np.floating):
-        result = array
+        result = array.astype(dtype, copy=False)
     elif np.issubdtype(dtype, np.integer):
         scale, zero_point = quantization
         if scale <= 0:
@@ -379,8 +379,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--normalization",
         choices=("zero_one", "minus_one_one", "none"),
-        default="zero_one",
-        help="Pre-processamento para modelos float (padrao: zero_one)",
+        default="none",
+        help="Pre-processamento para modelos float (padrao: none, faixa 0..255)",
     )
     parser.add_argument("--warmup", type=int, default=5, help="Invocacoes descartadas antes da medicao")
     parser.add_argument(
