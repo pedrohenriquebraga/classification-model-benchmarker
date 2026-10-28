@@ -1,12 +1,7 @@
 """Benchmark de modelos de classificacao em TensorFlow Lite.
 
-Formatos de dataset suportados:
-  1. Diretorios: dataset/<classe>/*.jpg
-  2. CSV com cabecalho contendo ``path`` e ``label``. Caminhos relativos sao
-     resolvidos em relacao ao diretorio do CSV.
-
 Exemplo:
-    python main.py --model modelo.tflite --dataset dataset --output resultados
+    python main.py --model modelo.tflite --dataset dataset --labels labels.txt --output resultados
 """
 
 from __future__ import annotations
@@ -36,7 +31,6 @@ class Sample:
 
 
 def load_interpreter(model_path: Path, threads: int) -> Any:
-    """Carrega um Interpreter sem importar TensorFlow antes de ser necessario."""
     try:
         from tflite_runtime.interpreter import Interpreter
     except ImportError:
@@ -151,6 +145,32 @@ def output_class(output: np.ndarray) -> int:
     return int(np.argmax(values))
 
 
+def classification_metrics(
+    matrix: np.ndarray, labels: Sequence[str], support: np.ndarray
+) -> dict[str, dict[str, float | int]]:
+    metrics: dict[str, dict[str, float | int]] = {}
+    for index, label in enumerate(labels):
+        true_positive = int(matrix[index, index])
+        predicted_positive = int(matrix[:, index].sum())
+        actual_positive = int(support[index])
+        precision = (
+            true_positive / predicted_positive if predicted_positive else 0.0
+        )
+        recall = true_positive / actual_positive if actual_positive else 0.0
+        f1_score = (
+            2 * precision * recall / (precision + recall)
+            if precision + recall
+            else 0.0
+        )
+        metrics[label] = {
+            "precision": precision,
+            "recall": recall,
+            "f1-score": f1_score,
+            "support": actual_positive,
+        }
+    return metrics
+
+
 def class_names_from_samples(samples: Sequence[Sample]) -> list[str]:
     return sorted({sample.label for sample in samples})
 
@@ -208,6 +228,8 @@ def benchmark_model(
         interpreter.invoke()
 
     matrix = np.zeros((len(class_names), len(class_names)), dtype=np.int64)
+    support = np.zeros(len(class_names), dtype=np.int64)
+    misclassified: list[dict[str, str]] = []
     correct = 0
     inference_seconds = 0.0
     started_total = time.perf_counter()
@@ -222,15 +244,29 @@ def benchmark_model(
         inference_seconds += time.perf_counter() - started
         predicted = output_class(interpreter.get_tensor(output_details[0]["index"]))
         expected = label_to_index[sample.label]
+        support[expected] += 1
+        predicted_label = (
+            model_labels[predicted]
+            if model_labels is not None and predicted < len(model_labels)
+            else str(predicted)
+        )
+        predicted_label_index: int | None = None
         if predicted in selected_model_indices:
             if model_labels is None:
                 predicted_label_index = predicted
             else:
-                predicted_label = model_labels[predicted]
                 predicted_label_index = label_to_index.get(predicted_label)
             if predicted_label_index is not None:
                 matrix[expected, predicted_label_index] += 1
                 correct += int(expected == predicted_label_index)
+        if predicted_label_index != expected:
+            misclassified.append(
+                {
+                    "path": str(sample.path.resolve()),
+                    "actual": sample.label,
+                    "predicted": predicted_label,
+                }
+            )
         if sample_index == 1 or sample_index % progress_interval == 0:
             elapsed = time.perf_counter() - started_total
             rate = sample_index / elapsed if elapsed else 0.0
@@ -259,6 +295,8 @@ def benchmark_model(
         "threads": threads,
         "labels": list(class_names),
         "confusion_matrix": matrix.tolist(),
+        "classification_report": classification_metrics(matrix, class_names, support),
+        "misclassified": misclassified,
     }
 
 
@@ -278,6 +316,30 @@ def write_results(results: Sequence[dict[str, Any]], output_dir: Path) -> None:
             writer.writerows(
                 [label, *row]
                 for label, row in zip(result["labels"], result["confusion_matrix"])
+            )
+        with (
+            model_output_dir / (model_name + "_classification_report.csv")
+        ).open("w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow(["class", "precision", "recall", "f1-score", "support"])
+            writer.writerows(
+                [
+                    label,
+                    result["classification_report"][label]["precision"],
+                    result["classification_report"][label]["recall"],
+                    result["classification_report"][label]["f1-score"],
+                    result["classification_report"][label]["support"],
+                ]
+                for label in result["labels"]
+            )
+        with (
+            model_output_dir / (model_name + "_misclassified.csv")
+        ).open("w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow(["path", "actual", "predicted"])
+            writer.writerows(
+                [sample["path"], sample["actual"], sample["predicted"]]
+                for sample in result["misclassified"]
             )
         (model_output_dir / "results.txt").write_text(
             "\n".join(format_text_report(result)), encoding="utf-8"
@@ -301,8 +363,25 @@ def format_text_report(result: dict[str, Any]) -> list[str]:
         f"Normalizacao: {result['normalization']}",
         f"Threads: {result['threads']}",
         "",
-        "Matriz de confusao (real nas linhas, previsto nas colunas):",
+        "Relatorio de classificacao:",
+        "classe\tprecision\trecall\tf1-score\tsupport",
     ]
+    lines.extend(
+        "{}\t{:.4f}\t{:.4f}\t{:.4f}\t{}".format(
+            label,
+            result["classification_report"][label]["precision"],
+            result["classification_report"][label]["recall"],
+            result["classification_report"][label]["f1-score"],
+            result["classification_report"][label]["support"],
+        )
+        for label in result["labels"]
+    )
+    lines.extend(
+        [
+            "",
+        "Matriz de confusao (real nas linhas, previsto nas colunas):",
+        ]
+    )
     labels = result["labels"]
     matrix = result["confusion_matrix"]
     lines.append("real\\previsto\t" + "\t".join(labels))
@@ -325,14 +404,24 @@ def write_confusion_matrix_image(result: dict[str, Any], output_path: Path) -> N
         if bold_font_path.exists()
         else font
     )
+    metrics_font = (
+        ImageFont.truetype(font_path, 14) if font_path.exists() else font
+    )
+    metrics_bold_font = (
+        ImageFont.truetype(bold_font_path, 14)
+        if bold_font_path.exists()
+        else metrics_font
+    )
     cell_size = 90
     margin_left = 150
     margin_top = 115
+    margin_right = 390
+    matrix_width = cell_size * len(labels)
     image = Image.new(
         "RGB",
         (
-            margin_left + cell_size * len(labels) + 20,
-            margin_top + cell_size * len(labels) + 20,
+            margin_left + matrix_width + margin_right,
+            margin_top + matrix_width + 20,
         ),
         "white",
     )
@@ -368,6 +457,33 @@ def write_confusion_matrix_image(result: dict[str, Any], output_path: Path) -> N
         row_top = margin_top + index * cell_size
         draw.text((column_left + 8, margin_top - 30), label, fill="black", font=font)
         draw.text((20, row_top + 32), label, fill="black", font=font)
+
+    metrics = result["classification_report"]
+    metrics_left = margin_left + matrix_width + 35
+    metrics_top = 55
+    draw.text(
+        (metrics_left, metrics_top),
+        "Metricas por classe",
+        fill="black",
+        font=metrics_bold_font,
+    )
+    metric_headers = ("classe", "precision", "recall", "f1-score", "support")
+    metric_x = (metrics_left, metrics_left + 65, metrics_left + 135, metrics_left + 195, metrics_left + 265)
+    header_top = metrics_top + 35
+    for x, header in zip(metric_x, metric_headers):
+        draw.text((x, header_top), header, fill="black", font=metrics_bold_font)
+    for index, label in enumerate(labels):
+        metric = metrics[label]
+        row_top = header_top + 25 + index * cell_size
+        values = (
+            label,
+            f"{metric['precision']:.4f}",
+            f"{metric['recall']:.4f}",
+            f"{metric['f1-score']:.4f}",
+            str(metric["support"]),
+        )
+        for x, value in zip(metric_x, values):
+            draw.text((x, row_top), value, fill="black", font=metrics_font)
     image.save(output_path)
 
 
